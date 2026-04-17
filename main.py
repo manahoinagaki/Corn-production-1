@@ -1,16 +1,21 @@
 import ee
 import pandas as pd
 import matplotlib.pyplot as plt
-import sys
+import sqlite3  # データベース接続用
 import requests
+import os
 
 # --- 設定：プロジェクトIDとAPIキー ---
-project_name = ''
+project_name = 'my-project-1-rice'
 USDA_API_KEY = '' 
 
+# Earth Engineの初期化
 try:
+    if not project_name:
+        raise ValueError("project_name が空です。Google CloudのプロジェクトIDを入力してください。")
     ee.Initialize(project=project_name)
 except Exception as e:
+    print(f"EE初期化中: {e}")
     ee.Authenticate()
     ee.Initialize(project=project_name)
 
@@ -23,6 +28,7 @@ roi_area = ee.Geometry.Rectangle([lon - 0.01, lat - 0.01, lon + 0.01, lat + 0.01
 
 START_DATE = '2015-04-01'
 END_DATE = '2024-10-01'
+DB_NAME = "agri_data.db"  # 保存するデータベースファイル名
 
 # ==========================================
 # 関数定義
@@ -61,6 +67,16 @@ def extract_data(collection, geometry, scale=30):
         return ee.Feature(None).set('date', img.date().format('YYYY-MM-dd')).set(stats)
     info = valid.map(ex).getInfo()
     return pd.DataFrame([f['properties'] for f in info['features'] if 'date' in f['properties']])
+
+def save_to_sqlite(df, table_name, db_name=DB_NAME):
+    """データフレームをSQLiteデータベースに保存する関数"""
+    try:
+        conn = sqlite3.connect(db_name)
+        df.to_sql(table_name, conn, if_exists='replace', index=True)
+        conn.close()
+        print(f"✅ Table '{table_name}' を {db_name} に保存しました。")
+    except Exception as e:
+        print(f"❌ データベース保存エラー ({table_name}): {e}")
 
 # ==========================================
 # データ収集
@@ -127,7 +143,7 @@ for year in years:
         
         annual_summary_list.append({
             'Year': year,
-            'USDA_Yield_bu_acre': year_yield, # ★ここに追加
+            'USDA_Yield_bu_acre': year_yield,
             'Max_NDVI': max_ndvi,
             'Max_NDVI_Date': max_ndvi_date.strftime('%Y-%m-%d'),
             'Max_Temp_C': max_temp,
@@ -136,17 +152,42 @@ for year in years:
 
 df_annual_summary = pd.DataFrame(annual_summary_list)
 
-# CSV保存（名前を summary に変更して分かりやすくしました）
+# ==========================================
+# 保存処理（グラフ表示の前に実行）
+# ==========================================
+print("\n--- 保存処理を開始 ---")
+
+# 1. CSV保存
 df_monthly.to_csv('monthly_report.csv', encoding='utf-8-sig')
 df_annual_summary.to_csv('annual_summary_report.csv', index=False, encoding='utf-8-sig')
+print("CSVファイルを保存しました。")
 
-print("CSVファイルを保存しました:")
-print("- monthly_report.csv (月次平均/合計)")
-print("- annual_summary_report.csv (年間の最大値とUSDA収穫量)")
+# 2. SQLiteデータベース保存
+save_to_sqlite(df_monthly, "monthly_data")
+save_to_sqlite(df_annual_summary, "annual_summary")
+save_to_sqlite(merged, "raw_combined_data")
 
-# ターミナルにも結果を少し表示
-print("\n--- 年次サマリー (抜粋) ---")
-print(df_annual_summary[['Year', 'USDA_Yield_bu_acre', 'Max_NDVI']].to_string(index=False))
+# データベースファイルの存在確認
+if os.path.exists(DB_NAME):
+    print(f"確認: データベースファイル '{DB_NAME}' は正常に作成されました。")
+    print(f"場所: {os.path.abspath(DB_NAME)}")
+else:
+    print(f"警告: '{DB_NAME}' が見つかりません。")
+
+# ==========================================
+# ★データベースへの保存処理を追加★
+# ==========================================
+print("\n--- データベースを更新中 ---")
+# 1. 月次レポートをテーブル名 'monthly_data' として保存
+save_to_sqlite(df_monthly, "monthly_data")
+# 2. 年次サマリーをテーブル名 'annual_summary' として保存
+save_to_sqlite(df_annual_summary, "annual_summary")
+# 3. 補間済みの全生データをテーブル名 'raw_combined_data' として保存
+save_to_sqlite(merged, "raw_combined_data")
+
+# CSVも念のため保存
+df_monthly.to_csv('monthly_report.csv', encoding='utf-8-sig')
+df_annual_summary.to_csv('annual_summary_report.csv', index=False, encoding='utf-8-sig')
 
 # ==========================================
 # 可視化：気象統合4段ダッシュボード
