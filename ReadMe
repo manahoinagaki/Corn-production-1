@@ -1,0 +1,186 @@
+# 🌽 CORN-PRODUCTION-1
+
+衛星データと気象データを活用したトウモロコシ生産量モニタリング・分析システム
+
+![Python](https://img.shields.io/badge/Python-3.10+-blue?logo=python)
+![FastAPI](https://img.shields.io/badge/FastAPI-0.100+-green?logo=fastapi)
+![Google Earth Engine](https://img.shields.io/badge/Google%20Earth%20Engine-API-lightgreen?logo=google)
+![SQLite](https://img.shields.io/badge/SQLite-3-blue?logo=sqlite)
+
+---
+
+## 概要
+
+**CORN-PRODUCTION-1** は、Google Earth Engine を通じて衛星画像・レーダー・気象データを取得し、USDA（米国農務省）の公式収穫量統計と統合して分析するデータパイプラインシステムです。
+
+処理結果はローカルの SQLite データベースに保存され、FastAPI サーバーを介して REST API として公開されます。
+
+---
+
+## 主な機能
+
+- 🛰️ **Sentinel-2** による NDVI（植生指数）の時系列取得
+- 📡 **Sentinel-1 SAR** による後方散乱（VV/VH）および RVI（レーダー植生指数）の算出
+- 🌤️ **ERA5 再解析データ** による日次気温・降水量の取得
+- 🌾 **USDA NASS API** からの郡別トウモロコシ収穫量（bu/acre）統合
+- 📊 月次・年次集計レポートの自動生成（CSV / SQLite）
+- 🖥️ 4パネルの気象×衛星統合ダッシュボードの可視化
+- 🚀 FastAPI による REST API（JSON / HTML テーブル表示対応）
+
+---
+
+## プロジェクト構成
+
+```
+CORN-PRODUCTION-1/
+├── main.py                    # データ収集・処理パイプライン
+├── api.py                     # FastAPI REST サーバー
+├── agri_data.db               # SQLite データベース（自動生成）
+├── monthly_report.csv         # 月次集計レポート（自動生成）
+├── annual_summary_report.csv  # 年次サマリーレポート（自動生成）
+└── .venv/                     # Python 仮想環境
+```
+
+---
+
+## 必要条件
+
+### Python パッケージ
+
+```bash
+pip install earthengine-api pandas matplotlib requests fastapi uvicorn
+```
+
+### 外部サービス
+
+| サービス | 用途 | 取得先 |
+|---------|------|--------|
+| Google Cloud Project | Earth Engine API の有効化 | [console.cloud.google.com](https://console.cloud.google.com) |
+| USDA NASS API キー | 郡別収穫量データの取得 | [quickstats.nass.usda.gov/api](https://quickstats.nass.usda.gov/api) |
+
+---
+
+## セットアップ
+
+### 1. 仮想環境の作成と有効化
+
+```bash
+python -m venv .venv
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
+pip install earthengine-api pandas matplotlib requests fastapi uvicorn
+```
+
+### 2. 認証情報の設定
+
+`main.py` の先頭にある以下の変数を書き換えてください。
+
+```python
+project_name = 'your-gcp-project-id'  # Google Cloud プロジェクト ID
+USDA_API_KEY = 'your-usda-api-key'    # USDA NASS API キー
+```
+
+> **Note:** USDA_API_KEY を空欄のままにすると USDA データ取得はスキップされます。衛星データの収集は引き続き実行されます。
+
+### 3. Earth Engine の認証（初回のみ）
+
+```bash
+earthengine authenticate
+```
+
+### 4. 対象地域・期間の変更（任意）
+
+デフォルトはネブラスカ州リンカーン郡を対象としています。変更する場合は `main.py` を編集してください。
+
+```python
+lon, lat     = -100.55, 41.14   # 経度・緯度
+START_DATE   = '2015-04-01'
+END_DATE     = '2024-10-01'
+```
+
+---
+
+## 実行方法
+
+### Step 1 — データ収集パイプラインの実行
+
+```bash
+python main.py
+```
+
+実行すると以下の処理が行われます：
+
+1. USDA 統計（2015〜2023年）の取得
+2. Google Earth Engine から衛星・気象データを収集
+3. データの統合・線形補間・月次/年次集計
+4. `agri_data.db`、`monthly_report.csv`、`annual_summary_report.csv` へ保存
+5. 4パネルのダッシュボード表示
+
+### Step 2 — API サーバーの起動
+
+```bash
+python api.py
+```
+
+起動後、以下の URL でアクセスできます：`http://127.0.0.1:8000`
+
+---
+
+## API エンドポイント
+
+| エンドポイント | メソッド | レスポンス | 説明 |
+|--------------|--------|-----------|------|
+| `/` | GET | JSON | サーバー稼働確認・エンドポイント一覧 |
+| `/monthly` | GET | JSON | 月次集計データ一覧 |
+| `/annual` | GET | JSON | 年次サマリーデータ一覧 |
+| `/view-annual` | GET | HTML | 年次サマリーのブラウザ表示 |
+
+---
+
+## データベース構成
+
+`agri_data.db` には以下の3テーブルが格納されます。
+
+| テーブル名 | 内容 |
+|-----------|------|
+| `monthly_data` | 月次平均気温・合計降水量・平均 NDVI / RVI / VH |
+| `annual_summary` | 年次最大 NDVI・最高気温・ピーク日・USDA 収穫量 |
+| `raw_combined_data` | 補間済みの全観測データ（日次・観測単位） |
+
+---
+
+## データソース
+
+| データソース | データセット ID | 取得指標 |
+|------------|--------------|---------|
+| Sentinel-2（Copernicus） | `COPERNICUS/S2_SR_HARMONIZED` | NDVI（B8/B4 正規化差分） |
+| Sentinel-1（Copernicus） | `COPERNICUS/S1_GRD`（IW モード） | VV・VH 後方散乱、RVI |
+| ERA5（ECMWF） | `ECMWF/ERA5_LAND/DAILY_AGGR` | 気温（℃）・降水量（mm） |
+| USDA NASS | Quick Stats API | トウモロコシ収穫量（bu/acre） |
+
+---
+
+## ダッシュボード
+
+`main.py` 実行後に表示される4パネルグラフの内容：
+
+| パネル | 内容 |
+|-------|------|
+| ① | NDVI 時系列（緑）＋ USDA 収穫量バー（赤、右軸） |
+| ② | Sentinel-1 VH 後方散乱（植生構造の指標） |
+| ③ | RVI（レーダー植生指数：VV と VH から算出） |
+| ④ | ERA5 による日次気温（℃）と降水量（mm） |
+
+---
+
+## 注意事項
+
+- Earth Engine のクエリは対象期間や面積によって数分かかる場合があります。
+- USDA API は郡・年度によっては空のレスポンスを返すことがあります。
+- データベースは実行のたびに上書き（`if_exists='replace'`）されます。前回のデータを保持したい場合は、実行前に `agri_data.db` をバックアップしてください。
+- Sentinel-2 のクラウドフィルタは雲量 50% 未満を対象としています。地域によって調整が必要な場合は `main.py` の該当箇所を変更してください。
+
+---
+
+## ライセンス
+
+本プロジェクトは研究・デモンストレーション目的で公開されています。
