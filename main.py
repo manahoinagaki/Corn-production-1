@@ -7,7 +7,7 @@ import os
 
 # --- 設定：プロジェクトIDとAPIキー ---
 project_name = 'my-project-1-rice'
-USDA_API_KEY = '' 
+USDA_API_KEY = '2FAEDCCD-2130-3902-9A67-DD087A9747FA' 
 
 # Earth Engineの初期化
 try:
@@ -130,6 +130,7 @@ for year in years:
         # 最大値の特定
         max_ndvi = year_data['NDVI'].max()
         max_ndvi_date = year_data['NDVI'].idxmax()
+        max_rvi = year_data['RVI'].max()
         max_temp = year_data['Temp_C'].max()
         max_temp_date = year_data['Temp_C'].idxmax()
         
@@ -146,6 +147,7 @@ for year in years:
             'USDA_Yield_bu_acre': year_yield,
             'Max_NDVI': max_ndvi,
             'Max_NDVI_Date': max_ndvi_date.strftime('%Y-%m-%d'),
+            'Max_RVI': max_rvi,
             'Max_Temp_C': max_temp,
             'Max_Temp_Date': max_temp_date.strftime('%Y-%m-%d')
         })
