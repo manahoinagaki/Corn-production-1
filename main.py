@@ -4,11 +4,34 @@ import matplotlib.pyplot as plt
 import sqlite3  # データベース接続用
 import requests
 import os
+import time
 
+
+# ==========================================
+# 設定
+# ==========================================
 # --- 設定：プロジェクトIDとAPIキー ---
 project_name = 'my-project-1-rice'
 USDA_API_KEY = '2FAEDCCD-2130-3902-9A67-DD087A9747FA' 
+DB_NAME = "agri_data.db"
 
+locations  = [
+    (-100.55, 41.14), # 地点1 (既存)
+    (-100.60, 41.15), # 地点2 (近隣)
+    (-100.50, 41.10), # 地点3 (近隣)
+    (-96.35, 40.85),  # 地点4 (ネブラスカ州別エリア)
+    (-93.50, 42.00)   # 地点5 (アイオワ州: 最重要エリア)
+]
+# roi_point = ee.Geometry.Point([lon, lat])
+# roi_area = ee.Geometry.Rectangle([lon - 0.01, lat - 0.01, lon + 0.01, lat + 0.01])
+
+START_DATE = '2015-04-01'
+END_DATE = '2024-10-01'
+DB_NAME = "agri_data.db"  # 保存するデータベースファイル名
+
+# ==========================================
+# Earth Engine 初期化
+# ==========================================
 # Earth Engineの初期化
 try:
     if not project_name:
@@ -20,227 +43,253 @@ except Exception as e:
     ee.Initialize(project=project_name)
 
 # ==========================================
-# 設定：地点と期間
-# ==========================================
-lon, lat = [
-    (-100.55, 41.14), # 地点1 (既存)
-    (-100.60, 41.15), # 地点2 (近隣)
-    (-100.50, 41.10), # 地点3 (近隣)
-    (-96.35, 40.85),  # 地点4 (ネブラスカ州別エリア)
-    (-93.50, 42.00)   # 地点5 (アイオワ州: 最重要エリア)
-]
-roi_point = ee.Geometry.Point([lon, lat])
-roi_area = ee.Geometry.Rectangle([lon - 0.01, lat - 0.01, lon + 0.01, lat + 0.01])
-
-START_DATE = '2015-04-01'
-END_DATE = '2024-10-01'
-DB_NAME = "agri_data.db"  # 保存するデータベースファイル名
-
-# ==========================================
 # 関数定義
 # ==========================================
-def get_location_info(geometry):
+def get_location_info(point):
+    """郡名取得"""
     try:
         counties = ee.FeatureCollection("TIGER/2018/Counties")
-        county_feature = counties.filterBounds(geometry).first()
-        name = county_feature.get('NAME').getInfo().upper()
+        county = counties.filterBounds(point).first()
+        name = county.get("NAME").getInfo().upper()
         return name, "NEBRASKA"
     except:
-        return "LINCOLN", "NEBRASKA"
+        return "UNKNOWN", "NEBRASKA"
+    
+def fetch_usda_yield(state, county, start_year, end_year):
+    """USDA収穫量取得"""
+    results = []
+    url = "https://quickstats.nass.usda.gov/api/api_GET/"
 
-def fetch_usda_yield_series(state, county, start_year, end_year):
-    yield_list = []
-    base_url = "https://quickstats.nass.usda.gov/api/api_GET/"
-    print(f"USDA統計（{start_year}-{end_year}）を取得中...")
     for year in range(start_year, end_year + 1):
         params = {
-            "key": USDA_API_KEY, "commodity_desc": "CORN", "year": year,
-            "state_name": state, "county_name": county,
-            "statisticcat_desc": "YIELD", "unit_desc": "BU / ACRE", "format": "JSON"
+            "key": USDA_API_KEY,
+            "commodity_desc": "CORN",
+            "year": year,
+            "state_name": state,
+            "county_name": county,
+            "statisticcat_desc": "YIELD",
+            "unit_desc": "BU / ACRE",
+            "format": "JSON"
         }
+
         try:
-            res = requests.get(base_url, params=params, timeout=10)
-            if res.status_code == 200:
-                val = res.json()['data'][0]['Value']
-                yield_list.append({'date': pd.to_datetime(f'{year}-09-01'), 'yield_val': float(val.replace(',', ''))})
-        except: continue
-    return pd.DataFrame(yield_list)
+            r = requests.get(url, params=params, timeout=10)
+            data = r.json()["data"]
+
+            if data:
+                val = float(data[0]["Value"].replace(",", ""))
+                results.append({
+                    "year": year,
+                    "yield_val": val
+                })
+        except:
+            continue
+
+    return pd.DataFrame(results)
+    
 
 def extract_data(collection, geometry, scale=30):
-    valid = collection.filter(ee.Filter.notNull(['system:time_start']))
-    def ex(img):
-        stats = img.reduceRegion(reducer=ee.Reducer.mean(), geometry=geometry, scale=scale)
-        return ee.Feature(None).set('date', img.date().format('YYYY-MM-dd')).set(stats)
-    info = valid.map(ex).getInfo()
-    return pd.DataFrame([f['properties'] for f in info['features'] if 'date' in f['properties']])
+    """Earth Engine データ抽出"""
+    def reducer(img):
+        stats = img.reduceRegion(
+            reducer=ee.Reducer.mean(),
+            geometry=geometry,
+            scale=scale
+        )
 
-def save_to_sqlite(df, table_name, db_name=DB_NAME):
-    """データフレームをSQLiteデータベースに保存する関数"""
-    try:
-        conn = sqlite3.connect(db_name)
-        df.to_sql(table_name, conn, if_exists='replace', index=True)
-        conn.close()
-        print(f"✅ Table '{table_name}' を {db_name} に保存しました。")
-    except Exception as e:
-        print(f"❌ データベース保存エラー ({table_name}): {e}")
+        return ee.Feature(None).set(
+            "date", img.date().format("YYYY-MM-dd")
+        ).set(stats)
 
-# 成長期（5月〜9月）の積算温度を計算
-def calculate_gdd(df):
-    growing_season = df[(df.index.month >= 5) & (df.index.month <= 9)]
-    # トウモロコシの基本温度 10度、上限 30度で計算
-    gdd = growing_season['Temp_C'].apply(lambda x: max(min(x, 30) - 10, 0))
-    return gdd.sum()
+    info = collection.map(reducer).getInfo()
 
-# ==========================================
-# データ収集
-# ==========================================
-county_name, state_name = get_location_info(roi_point)
-df_yield_stats = fetch_usda_yield_series(state_name, county_name, 2015, 2023)
+    return pd.DataFrame([
+        f["properties"]
+        for f in info["features"]
+    ])
 
-print("衛星・気象データを抽出中...")
-df_s2 = extract_data(ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED').filterBounds(roi_area).filterDate(START_DATE, END_DATE).filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 50)).map(lambda img: img.addBands(img.normalizedDifference(['B8', 'B4']).rename('NDVI'))).select(['NDVI']), roi_area)
-df_s1 = extract_data(ee.ImageCollection('COPERNICUS/S1_GRD').filterBounds(roi_area).filterDate(START_DATE, END_DATE).filter(ee.Filter.eq('instrumentMode', 'IW')).select(['VV', 'VH']), roi_area)
-df_wx = extract_data(ee.ImageCollection("ECMWF/ERA5_LAND/DAILY_AGGR").filterBounds(roi_area).filterDate(START_DATE, END_DATE).map(lambda img: img.addBands(img.select('temperature_2m').subtract(273.15).rename('Temp_C')).addBands(img.select('total_precipitation_sum').multiply(1000).rename('Precip_mm')).select(['Temp_C', 'Precip_mm'])), roi_area, scale=1000)
-
-# ==========================================
-# データ統合
-# ==========================================
 def clean(df):
-    if df.empty: return df
-    df['date'] = pd.to_datetime(df['date'])
-    return df.groupby('date').mean().sort_index()
+    """日付整形"""
+    if df.empty:
+        return df
 
-merged = pd.concat([clean(df_s2), clean(df_s1), clean(df_wx)], axis=1).sort_index()
-# 指標の計算
-if 'VH' in merged.columns and 'VV' in merged.columns:
-    merged['RVI'] = 4 * merged['VH'] / (merged['VV'] + merged['VH'])
+    df["date"] = pd.to_datetime(df["date"])
+    return df.groupby("date").mean().sort_index()
 
-# 線形補間
-merged[['NDVI', 'VH', 'VV', 'Temp_C', 'RVI']] = merged[['NDVI', 'VH', 'VV', 'Temp_C', 'RVI']].interpolate(method='linear')
-merged['Precip_mm'] = merged['Precip_mm'].fillna(0)
+def save_sql(df, table):
+    conn = sqlite3.connect(DB_NAME)
+    df.to_sql(table, conn, if_exists="replace", index=False)
+    conn.close()
 
-## ==========================================
-# 月次集計 & 年次Max & USDA収穫量の統合
+def plot_dashboard(df, county):
+    """可視化"""
+    fig, axes = plt.subplots(3, 1, figsize=(12, 10), sharex=True)
+
+    axes[0].plot(df.index, df["NDVI"])
+    axes[0].set_title(f"{county} NDVI")
+
+    axes[1].plot(df.index, df["RVI"])
+    axes[1].set_title("RVI")
+
+    axes[2].plot(df.index, df["Temp_C"])
+    axes[2].bar(df.index, df["Precip_mm"], alpha=0.3)
+    axes[2].set_title("Weather")
+
+    plt.tight_layout()
+    plt.show()
+
+# def save_to_sqlite(df, table_name, db_name=DB_NAME):
+#     """データフレームをSQLiteデータベースに保存する関数"""
+#     try:
+#         conn = sqlite3.connect(db_name)
+#         df.to_sql(table_name, conn, if_exists='replace', index=True)
+#         conn.close()
+#         print(f"✅ Table '{table_name}' を {db_name} に保存しました。")
+#     except Exception as e:
+#         print(f"❌ データベース保存エラー ({table_name}): {e}")
+
+# # 成長期（5月〜9月）の積算温度を計算
+# def calculate_gdd(df):
+#     growing_season = df[(df.index.month >= 5) & (df.index.month <= 9)]
+#     # トウモロコシの基本温度 10度、上限 30度で計算
+#     gdd = growing_season['Temp_C'].apply(lambda x: max(min(x, 30) - 10, 0))
+#     return gdd.sum()
+
 # ==========================================
-print("月次・年次統計（収穫量統合版）を計算中...")
+# メイン
+# ==========================================
+all_results = []
 
-# 1. 月次レポートの作成
-df_monthly = merged.resample('MS').agg({
-    'Temp_C': 'mean',
-    'Precip_mm': 'sum',
-    'NDVI': 'mean',
-    'RVI': 'mean',
-    'VH': 'mean'
-})
+for lon, lat in locations:
 
-# 2. 年次最大値とUSDA実績の統合
-annual_summary_list = []
-years = merged.index.year.unique()
+    print(f"\n解析中: {lon}, {lat}")
 
-for year in years:
-    year_data = merged[merged.index.year == year]
-    if not year_data.empty:
-        # 最大値の特定
-        max_ndvi = year_data['NDVI'].max()
-        max_ndvi_date = year_data['NDVI'].idxmax()
-        max_rvi = year_data['RVI'].max()
-        max_temp = year_data['Temp_C'].max()
-        max_temp_date = year_data['Temp_C'].idxmax()
-        
-        # この年のUSDA収穫量をdf_yield_statsから探す
-        # (df_yield_statsのdateから年を抽出して照合)
-        year_yield = None
-        if not df_yield_stats.empty:
-            match = df_yield_stats[df_yield_stats['date'].dt.year == year]
+    point = ee.Geometry.Point([lon, lat])
+    area = ee.Geometry.Rectangle([
+        lon - 0.03,
+        lat - 0.03,
+        lon + 0.03,
+        lat + 0.03
+    ])
+
+    county, state = get_location_info(point)
+
+    print(f"場所: {county}")
+
+    # USDA
+    df_yield = fetch_usda_yield(state, county, 2015, 2023)
+
+    # Sentinel-2
+    s2 = (
+        ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+        .filterBounds(area)
+        .filterDate(START_DATE, END_DATE)
+        .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", 50))
+        .map(lambda img:
+             img.addBands(
+                 img.normalizedDifference(["B8", "B4"])
+                 .rename("NDVI")
+             ))
+        .select(["NDVI"])
+    )
+
+    # Sentinel-1
+    s1 = (
+        ee.ImageCollection("COPERNICUS/S1_GRD")
+        .filterBounds(area)
+        .filterDate(START_DATE, END_DATE)
+        .select(["VV", "VH"])
+    )
+
+    # ERA5
+    wx = (
+        ee.ImageCollection("ECMWF/ERA5_LAND/DAILY_AGGR")
+        .filterBounds(area)
+        .filterDate(START_DATE, END_DATE)
+        .map(lambda img:
+             img.addBands(
+                 img.select("temperature_2m")
+                 .subtract(273.15)
+                 .rename("Temp_C")
+             ).addBands(
+                 img.select("total_precipitation_sum")
+                 .multiply(1000)
+                 .rename("Precip_mm")
+             ))
+        .select(["Temp_C", "Precip_mm"])
+    )
+
+    df_s2 = extract_data(s2, area)
+    df_s1 = extract_data(s1, area)
+    df_wx = extract_data(wx, area, scale=1000)
+
+    if df_s2.empty or df_s1.empty:
+        print("データ不足")
+        continue
+
+    merged = pd.concat([
+        clean(df_s2),
+        clean(df_s1),
+        clean(df_wx)
+    ], axis=1)
+
+    merged = merged.interpolate()
+    merged["Precip_mm"] = merged["Precip_mm"].fillna(0)
+
+    # RVI
+    merged["RVI"] = 4 * merged["VH"] / (
+        merged["VV"] + merged["VH"]
+    )
+
+    # 年次まとめ
+    for year in merged.index.year.unique():
+
+        data = merged[merged.index.year == year]
+
+        # ★ 7月だけのデータを抽出
+        july_data = data[data.index.month == 7]
+
+        # 7月のデータがない場合は、その年の最大値で代用
+        if not july_data.empty:
+            july_ndvi = july_data['NDVI'].mean()
+            july_rvi = july_data['RVI'].mean()
+            july_precip = july_data['Precip_mm'].sum()
+            july_gdd = july_data['Temp_C'].apply(lambda x: max(min(x, 30) - 10, 0)).sum()
+        else:
+            # データがない場合のデフォルト
+            july_ndvi, july_rvi, july_precip, july_gdd = 0, 0, 0, 0
+
+
+        y = None
+        if not df_yield.empty:
+            match = df_yield[df_yield["year"] == year]
             if not match.empty:
-                year_yield = match['yield_val'].values[0]
-        
-        annual_summary_list.append({
-            'Year': year,
-            'USDA_Yield_bu_acre': year_yield,
-            'Max_NDVI': max_ndvi,
-            'Max_NDVI_Date': max_ndvi_date.strftime('%Y-%m-%d'),
-            'Max_RVI': max_rvi,
-            'Max_Temp_C': max_temp,
-            'Max_Temp_Date': max_temp_date.strftime('%Y-%m-%d')
+                y = match["yield_val"].iloc[0]
+
+        all_results.append({
+            "Location": f"{lon}_{lat}",
+            "Year": year,
+            "Yield": y,
+            "July_NDVI": july_ndvi,  # 7月の平均を追加
+            "July_RVI": july_rvi,    # 7月の平均を追加
+            "July_Precip": july_precip, # 7月の合計降水量
+            "July_GDD": july_gdd,  # 7月の有効積算温度 (10度〜30度の範囲で計算)
+            "Max_NDVI": data["NDVI"].max(),
+            "Max_RVI": data["RVI"].max(),
+            "Max_Temp": data["Temp_C"].max()
         })
 
-df_annual_summary = pd.DataFrame(annual_summary_list)
+    # グラフ
+    plot_dashboard(merged, county)
+
+    time.sleep(2)
 
 # ==========================================
-# 保存処理（グラフ表示の前に実行）
+# 保存
 # ==========================================
-print("\n--- 保存処理を開始 ---")
+final_df = pd.DataFrame(all_results)
 
-# 1. CSV保存
-df_monthly.to_csv('monthly_report.csv', encoding='utf-8-sig')
-df_annual_summary.to_csv('annual_summary_report.csv', index=False, encoding='utf-8-sig')
-print("CSVファイルを保存しました。")
+save_sql(final_df, "annual_summary")
+final_df.to_csv("annual_summary.csv", index=False)
 
-# 2. SQLiteデータベース保存
-save_to_sqlite(df_monthly, "monthly_data")
-save_to_sqlite(df_annual_summary, "annual_summary")
-save_to_sqlite(merged, "raw_combined_data")
-
-# データベースファイルの存在確認
-if os.path.exists(DB_NAME):
-    print(f"確認: データベースファイル '{DB_NAME}' は正常に作成されました。")
-    print(f"場所: {os.path.abspath(DB_NAME)}")
-else:
-    print(f"警告: '{DB_NAME}' が見つかりません。")
-
-# ==========================================
-# ★データベースへの保存処理を追加★
-# ==========================================
-print("\n--- データベースを更新中 ---")
-# 1. 月次レポートをテーブル名 'monthly_data' として保存
-save_to_sqlite(df_monthly, "monthly_data")
-# 2. 年次サマリーをテーブル名 'annual_summary' として保存
-save_to_sqlite(df_annual_summary, "annual_summary")
-# 3. 補間済みの全生データをテーブル名 'raw_combined_data' として保存
-save_to_sqlite(merged, "raw_combined_data")
-
-# CSVも念のため保存
-df_monthly.to_csv('monthly_report.csv', encoding='utf-8-sig')
-df_annual_summary.to_csv('annual_summary_report.csv', index=False, encoding='utf-8-sig')
-
-# ==========================================
-# 可視化：気象統合4段ダッシュボード
-# ==========================================
-fig, axes = plt.subplots(4, 1, figsize=(12, 14), sharex=True)
-
-# 1. NDVI + USDA Yield
-axes[0].plot(merged.index, merged['NDVI'], color='green', alpha=0.6, label='NDVI')
-if not df_yield_stats.empty:
-    ax0_y = axes[0].twinx()
-    ax0_y.bar(df_yield_stats['date'], df_yield_stats['yield_val'], width=30, color='red', alpha=0.2, label='USDA Yield')
-    ax0_y.set_ylabel('Yield [bu/acre]', color='red')
-axes[0].set_title(f'Combined Agricultural Dashboard: {county_name} Co., {state_name}', fontweight='bold')
-axes[0].set_ylabel('NDVI Index')
-
-# 2. VH (Volume)
-axes[1].plot(merged.index, merged['VH'], color='blue', label='VH (Structure)')
-axes[1].set_ylabel('VH [dB]')
-
-# 3. RVI (Radar Index)
-if 'RVI' in merged.columns:
-    axes[2].plot(merged.index, merged['RVI'], color='purple', label='RVI')
-axes[2].set_ylabel('RVI')
-
-# 4. Weather (Temp + Precip)
-axes[3].plot(merged.index, merged['Temp_C'], color='orange', label='Temp', alpha=0.8)
-axes[3].set_ylabel('Temp [°C]', color='orange')
-axes[3].tick_params(axis='y', labelcolor='orange')
-
-ax4_right = axes[3].twinx()
-ax4_right.bar(merged.index, merged['Precip_mm'], color='skyblue', alpha=0.4, label='Precip', width=2.0)
-ax4_right.set_ylabel('Precip [mm]', color='skyblue')
-ax4_right.tick_params(axis='y', labelcolor='skyblue')
-axes[3].set_title('Weather: Temperature & Precipitation')
-
-for i, ax in enumerate(axes):
-    ax.grid(True, alpha=0.2)
-    ax.legend(loc='upper left', fontsize=9)
-
-plt.tight_layout()
-plt.show()
+print("完了")
