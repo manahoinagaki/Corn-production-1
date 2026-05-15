@@ -22,7 +22,13 @@ except Exception as e:
 # ==========================================
 # 設定：地点と期間
 # ==========================================
-lon, lat = -100.55, 41.14
+lon, lat = [
+    (-100.55, 41.14), # 地点1 (既存)
+    (-100.60, 41.15), # 地点2 (近隣)
+    (-100.50, 41.10), # 地点3 (近隣)
+    (-96.35, 40.85),  # 地点4 (ネブラスカ州別エリア)
+    (-93.50, 42.00)   # 地点5 (アイオワ州: 最重要エリア)
+]
 roi_point = ee.Geometry.Point([lon, lat])
 roi_area = ee.Geometry.Rectangle([lon - 0.01, lat - 0.01, lon + 0.01, lat + 0.01])
 
@@ -77,6 +83,13 @@ def save_to_sqlite(df, table_name, db_name=DB_NAME):
         print(f"✅ Table '{table_name}' を {db_name} に保存しました。")
     except Exception as e:
         print(f"❌ データベース保存エラー ({table_name}): {e}")
+
+# 成長期（5月〜9月）の積算温度を計算
+def calculate_gdd(df):
+    growing_season = df[(df.index.month >= 5) & (df.index.month <= 9)]
+    # トウモロコシの基本温度 10度、上限 30度で計算
+    gdd = growing_season['Temp_C'].apply(lambda x: max(min(x, 30) - 10, 0))
+    return gdd.sum()
 
 # ==========================================
 # データ収集
